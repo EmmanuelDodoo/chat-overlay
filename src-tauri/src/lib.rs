@@ -1,5 +1,49 @@
-use async_openai::types::{ChatCompletionRequestMessage, ChatCompletionResponseMessage, Role};
+use async_openai::{
+    config::OpenAIConfig,
+    error::OpenAIError,
+    types::{ChatCompletionRequestMessage, ChatCompletionResponseMessage, Role},
+    Client,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+pub mod chat_requests {
+    use async_openai::{
+        config::OpenAIConfig,
+        error::OpenAIError,
+        types::{
+            ChatCompletionRequestMessage, ChatCompletionResponseMessage,
+            CreateChatCompletionRequestArgs,
+        },
+        Client,
+    };
+
+    const CHAT_MODEL: &str = "gpt-3.5-turbo";
+
+    /// Asynchronously make a request to `CHAT_MODEL`, returning the Result.
+    /// The `"gpt-3.5-turbo` model is used if None is supplied for the model.
+    #[tokio::main]
+    pub async fn requeset_chat_model(
+        client: &Client<OpenAIConfig>,
+        messages: Vec<ChatCompletionRequestMessage>,
+        model: Option<&str>,
+    ) -> Result<ChatCompletionResponseMessage, OpenAIError> {
+        let request = CreateChatCompletionRequestArgs::default()
+            .model(model.unwrap_or(CHAT_MODEL))
+            .messages(messages)
+            .max_tokens(100_u16)
+            .temperature(0.5)
+            .build()?;
+
+        let response = client.chat().create(request).await?;
+
+        Ok(response
+            .choices
+            .first()
+            .expect("Response had an empty choice field")
+            .message
+            .to_owned())
+    }
+}
 
 pub trait ChatMessageTrait {
     /// Returns a copy the role of this Chat message
@@ -38,6 +82,8 @@ impl ChatMessageTrait for ChatCompletionResponseMessage {
 
 /// Message parsed from a ChatMessageTrait trait object.
 /// This is mainly to add extra data to it
+///
+/// I feel like this is causing more complexity than it's worth
 #[derive(Debug, Clone)]
 pub struct Message {
     id: usize,
@@ -48,7 +94,6 @@ pub struct Message {
 
 impl Message {
     /// Create a new message with the given `id`, `role`, and `content`.
-    #[allow(unused)]
     fn new(id: usize, role: Role, content: String) -> Message {
         let created_at = match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(n) => n.as_secs(),
@@ -111,17 +156,60 @@ pub struct ChatSession {
     /// Counter for the ids of this session's messages. Ids are
     /// Guaranteed to be unique for each message in this session.
     msg_id_counter: usize,
+
+    ///The chat model being used by this session
+    model: String,
 }
 
 impl ChatSession {
     /// Create a new Chat session with the supplied id and title
-    fn new(id: usize, title: String) -> ChatSession {
+    fn new(id: usize, title: String, model: &str) -> ChatSession {
         ChatSession {
             id,
             title,
             messages: vec![],
             msg_id_counter: 0,
+            model: model.to_string(),
         }
+    }
+
+    /// Processes a User message and makes a request to
+    /// The chat model. If successful, both the message and response
+    /// are stored, returning an Ok(()). Otherwise an Err(OpenAIError)
+    /// is returned
+    pub fn add_message(
+        &mut self,
+        contents: String,
+        client: &Client<OpenAIConfig>,
+    ) -> Result<(), OpenAIError> {
+        use chat_requests::requeset_chat_model;
+
+        let chat_request_msg = ChatCompletionRequestMessage {
+            role: Role::User,
+            content: Some(contents.clone()),
+            name: None,
+            function_call: None,
+        };
+
+        let msg = Message::new(self.msg_id_counter.to_owned(), Role::User, contents);
+
+        let mut temp_messages = self.messages.to_vec();
+        temp_messages.push(msg);
+
+        let response = requeset_chat_model(
+            client,
+            temp_messages
+                .to_vec()
+                .iter()
+                .map(|x| x.to_chat_resquest_msg())
+                .collect(),
+            Some(self.model.as_str()),
+        )?;
+
+        self.add_chat_message(chat_request_msg);
+        self.add_chat_message(response);
+
+        Ok(())
     }
 
     /// Adds a new chat message to this session, consuming it in the process.
@@ -131,7 +219,7 @@ impl ChatSession {
     /// implement this.
     ///
     /// The id and created at fields are automatically added to the message.
-    pub fn add_chat_message<T: ChatMessageTrait>(&mut self, msg: T) {
+    fn add_chat_message<T: ChatMessageTrait>(&mut self, msg: T) {
         let id = self.msg_id_counter;
         self.msg_id_counter += 1;
 
@@ -175,20 +263,27 @@ impl ChatSession {
 
 /// Struct for storing all Chat sessions
 /// Hold functions for creating and keeping track of new sessions
+#[derive(Debug, Clone)]
 pub struct Store {
     sessions: Vec<ChatSession>,
 
     /// Counter for the ids of this store's sessions. Ids are
     /// Guaranteed to be unique for each message in this session.
-    msg_id_counter: usize,
+    session_id_counter: usize,
+
+    ///The client for this store. Only supports the
+    /// OpenAI REST API based on OpenAPI spec.
+    client: Client<OpenAIConfig>,
 }
 
 impl Store {
-    ///Create a new Store with no sessions
-    pub fn new() -> Store {
+    ///Create a new Store with no sessions. Ownership of the
+    /// moved to this struct
+    pub fn new(client: Client<OpenAIConfig>) -> Store {
         Store {
             sessions: Vec::new(),
-            msg_id_counter: 0,
+            session_id_counter: 0,
+            client,
         }
     }
 
@@ -205,14 +300,25 @@ impl Store {
     /// Add a new message to the store, creating a chat session  for it.
     /// `title` is the title of the chat session created. The message is
     /// consumed in the process.
+    /// `model` must be a valid chat model
     ///
     /// Only request messages can be used to create a new session
-    pub fn add_session(&mut self, msg: ChatCompletionRequestMessage, title: String) {
-        let id = self.msg_id_counter;
-        self.msg_id_counter += 1;
-        let mut chs = ChatSession::new(id, title);
-        chs.add_chat_message(msg);
+    pub fn add_session(
+        &mut self,
+        msg: ChatCompletionRequestMessage,
+        title: String,
+        model: &str,
+    ) -> Result<(), OpenAIError> {
+        let id = self.session_id_counter;
+        self.session_id_counter += 1;
+
+        let mut chs = ChatSession::new(id, title, model);
+
+        chs.add_message(msg.get_content(), &self.client)?;
+
         self.sessions.push(chs);
+
+        Ok(())
     }
 
     /// Deletes chat session with matching id in this store. The right most,
@@ -237,12 +343,16 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_openai::types::{ChatCompletionRequestMessage, ChatCompletionResponseMessage, Role};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const MODEL: &str = "gpt-3.5-turbo";
 
     #[test]
     fn test_create_chat_thread() {
         let id = 2;
         let title = String::from("Something");
-        let mut ctd = ChatSession::new(id.clone(), title.clone());
+        let mut ctd = ChatSession::new(id.clone(), title.clone(), MODEL);
 
         assert_eq!(ctd.get_id(), id);
         assert_eq!(ctd.get_title(), title);
@@ -301,7 +411,7 @@ mod tests {
 
     #[test]
     fn test_session_add_and_remove() {
-        let mut chs = ChatSession::new(25, String::from("Testing adding messages"));
+        let mut chs = ChatSession::new(25, String::from("Testing adding messages"), MODEL);
 
         for i in 0..6 {
             if i % 2 == 0 {
@@ -344,15 +454,21 @@ mod tests {
 
     #[test]
     fn test_new_store() {
-        let store = Store::new();
+        let api_key = "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";
+        let config = OpenAIConfig::new().with_api_key(api_key);
+        let client = Client::with_config(config);
+        let store = Store::new(client);
 
         assert!(store.get_all_sessions().is_empty());
-        assert_eq!(0, store.msg_id_counter);
+        assert_eq!(0, store.session_id_counter);
     }
 
     #[test]
     fn test_store_add_session() {
-        let mut store = Store::new();
+        let api_key = "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";
+        let config = OpenAIConfig::new().with_api_key(api_key);
+        let client = Client::with_config(config);
+        let mut store = Store::new(client);
 
         assert!(store.get_all_sessions().is_empty());
 
@@ -362,7 +478,9 @@ mod tests {
             name: None,
             function_call: None,
         };
-        store.add_session(msg1, "Test Message 1".to_string());
+        store
+            .add_session(msg1, "Test Message 1".to_string(), MODEL)
+            .unwrap();
         assert_eq!(1, store.get_all_sessions().len());
         assert_eq!(0, store.get_all_sessions()[0].get_id());
         assert_eq!(
@@ -376,7 +494,9 @@ mod tests {
             name: None,
             function_call: None,
         };
-        store.add_session(msg2, "Test msg 2".to_string());
+        store
+            .add_session(msg2, "Test msg 2".to_string(), MODEL)
+            .unwrap();
         assert_eq!(2, store.get_all_sessions().len());
         assert_eq!(1, store.get_all_sessions()[1].get_id());
         assert_eq!(
@@ -384,14 +504,17 @@ mod tests {
             store.get_all_sessions()[1].get_messages()[0].get_content()
         );
         assert_eq!(
-            Role::System,
+            Role::User,
             store.get_all_sessions()[1].get_messages()[0].get_role()
         );
     }
 
     #[test]
     fn test_store_get_specific() {
-        let mut store = Store::new();
+        let api_key = "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";
+        let config = OpenAIConfig::new().with_api_key(api_key);
+        let client = Client::with_config(config);
+        let mut store = Store::new(client);
 
         let msg1 = ChatCompletionRequestMessage {
             role: Role::User,
@@ -412,9 +535,9 @@ mod tests {
             function_call: None,
         };
 
-        store.add_session(msg1, "Tired".to_string());
-        store.add_session(msg2, "Tired".to_string());
-        store.add_session(msg3, "Tired".to_string());
+        store.add_session(msg1, "Tired".to_string(), MODEL).unwrap();
+        store.add_session(msg2, "Tired".to_string(), MODEL).unwrap();
+        store.add_session(msg3, "Tired".to_string(), MODEL).unwrap();
 
         assert_eq!(
             store.get_session(2).unwrap().get_title(),
@@ -425,7 +548,10 @@ mod tests {
 
     #[test]
     fn test_store_delete_sessions() {
-        let mut store = Store::new();
+        let api_key = "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";
+        let config = OpenAIConfig::new().with_api_key(api_key);
+        let client = Client::with_config(config);
+        let mut store = Store::new(client);
 
         let msg1 = ChatCompletionRequestMessage {
             role: Role::User,
@@ -446,9 +572,9 @@ mod tests {
             function_call: None,
         };
 
-        store.add_session(msg1, "One".to_string());
-        store.add_session(msg2, "Two".to_string());
-        store.add_session(msg3, "Three".to_string());
+        store.add_session(msg1, "One".to_string(), MODEL).unwrap();
+        store.add_session(msg2, "Two".to_string(), MODEL).unwrap();
+        store.add_session(msg3, "Three".to_string(), MODEL).unwrap();
 
         assert_eq!(
             store.delete_session(2).unwrap().get_title(),
