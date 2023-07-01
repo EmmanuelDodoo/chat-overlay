@@ -108,17 +108,22 @@ impl Message {
         }
     }
 
+    /// Returns a copy of the id of this message
     pub fn get_id(&self) -> usize {
-        self.id
+        self.id.clone()
     }
 
+    /// Returns a copy of the contents of this message
     pub fn get_content(&self) -> String {
         self.content.clone()
     }
 
+    /// Returns a copy of the unix timestamp when this message of created.
     pub fn get_created_at(&self) -> u64 {
-        self.created_at
+        self.created_at.clone()
     }
+
+    /// Returns a copy of the role of this message
     pub fn get_role(&self) -> Role {
         self.role.clone()
     }
@@ -229,6 +234,7 @@ impl ChatSession {
     /// Deletes message with matching id in this chat session. The right most,
     /// deleted message is returned if possible.
     pub fn delete_message(&mut self, id: usize) -> Option<Message> {
+        // Same general approach like Store.delete_session()
         let mut accumulator: Vec<Message> = Vec::new();
 
         let target = self.messages.iter().fold(None, |acc, curr| {
@@ -244,18 +250,22 @@ impl ChatSession {
         target
     }
 
+    /// Renames this session to the `new_title` provided. `new_title` is
+    /// consumed in the process
     pub fn rename_session(&mut self, new_title: String) {
         self.title = new_title;
     }
 
+    /// Returns a copy of the title of this session
     pub fn get_title(&self) -> String {
         self.title.clone()
     }
 
+    /// Returns a copy of the id of this session
     pub fn get_id(&self) -> usize {
         self.id.clone()
     }
-
+    /// Returns a reference to the collection of messages in this session
     pub fn get_messages(&self) -> &Vec<Message> {
         self.messages.as_ref()
     }
@@ -278,7 +288,7 @@ pub struct Store {
 
 impl Store {
     ///Create a new Store with no sessions. Ownership of the
-    /// moved to this struct
+    /// client is moved to this struct
     pub fn new(client: Client<OpenAIConfig>) -> Store {
         Store {
             sessions: Vec::new(),
@@ -287,12 +297,13 @@ impl Store {
         }
     }
 
-    /// Returns all the active sessions
+    /// Returns reference to the collection of sessions
+    /// in this store
     pub fn get_all_sessions(&self) -> &Vec<ChatSession> {
         self.sessions.as_ref()
     }
 
-    /// Finds an returns a referencce the chat session with matching id if any exists
+    /// Finds and returns a reference to the chat session with matching id if any exists
     pub fn get_session(&self, id: usize) -> Option<&ChatSession> {
         self.sessions.iter().find(|x| x.get_id() == id)
     }
@@ -310,22 +321,24 @@ impl Store {
         model: &str,
     ) -> Result<(), OpenAIError> {
         let id = self.session_id_counter;
-        self.session_id_counter += 1;
 
         let mut chs = ChatSession::new(id, title, model);
 
         chs.add_message(msg.get_content(), &self.client)?;
 
+        self.session_id_counter += 1;
         self.sessions.push(chs);
 
         Ok(())
     }
 
-    /// Deletes chat session with matching id in this store. The right most,
+    /// Deletes any chat session with matching id in this store. The right most,
     /// deleted session is returned if possible.
     pub fn delete_session(&mut self, id: usize) -> Option<ChatSession> {
         let mut accumulator: Vec<ChatSession> = Vec::new();
 
+        // iter().filter() yields a new iterator and would not have returned any elements that
+        // fail the predicate. So I settled on this approach.
         let target = self.sessions.iter().fold(None, |acc, curr| {
             if curr.get_id() == id {
                 return Some(curr.to_owned());
@@ -454,8 +467,7 @@ mod tests {
 
     #[test]
     fn test_new_store() {
-        let api_key = "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";
-        let config = OpenAIConfig::new().with_api_key(api_key);
+        let config = OpenAIConfig::default();
         let client = Client::with_config(config);
         let store = Store::new(client);
 
@@ -465,8 +477,7 @@ mod tests {
 
     #[test]
     fn test_store_add_session() {
-        let api_key = "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";
-        let config = OpenAIConfig::new().with_api_key(api_key);
+        let config = OpenAIConfig::default();
         let client = Client::with_config(config);
         let mut store = Store::new(client);
 
@@ -511,8 +522,7 @@ mod tests {
 
     #[test]
     fn test_store_get_specific() {
-        let api_key = "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";
-        let config = OpenAIConfig::new().with_api_key(api_key);
+        let config = OpenAIConfig::default();
         let client = Client::with_config(config);
         let mut store = Store::new(client);
 
@@ -544,12 +554,12 @@ mod tests {
             "Tired".to_string()
         );
         assert!(store.get_session(40).is_none());
+        assert_eq!(store.get_all_sessions().len(), 3);
     }
 
     #[test]
     fn test_store_delete_sessions() {
-        let api_key = "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";
-        let config = OpenAIConfig::new().with_api_key(api_key);
+        let config = OpenAIConfig::default();
         let client = Client::with_config(config);
         let mut store = Store::new(client);
 
